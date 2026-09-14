@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<title>قدم دوم - گذاشتن لباس روی بدن</title>
+<style>
+  body {
+    font-family: Tahoma, sans-serif;
+    background: #111;
+    color: #eee;
+    text-align: center;
+    margin: 0;
+    padding: 20px;
+  }
+  h1 { font-size: 20px; margin-bottom: 10px; }
+  #container {
+    position: relative;
+    width: 640px;
+    max-width: 95vw;
+    aspect-ratio: 4 / 3;
+    margin: 40px auto 0;
+  }
+  video, canvas {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%;
+    height: 100%;
+    border-radius: 8px;
+  }
+  #status {
+    margin-top: 10px;
+    font-size: 14px;
+    color: #9f9;
+  }
+  #controls {
+    margin-top: 12px;
+    font-size: 13px;
+    color: #ccc;
+  }
+  #controls label {
+    margin: 0 6px;
+    display: inline-block;
+  }
+  #controls input[type="file"] {
+    color: #ccc;
+    font-size: 12px;
+  }
+</style>
+</head>
+<body>
+
+<h1>قدم دوم: گذاشتن لباس روی بدن (نسخه‌ی چندتکه)</h1>
+<div id="container">
+  <video id="webcam" autoplay playsinline muted></video>
+  <canvas id="output"></canvas>
+</div>
+<div id="controls">
+  <label><input type="checkbox" id="showSkeleton"> نمایش اسکلت/نقاط</label>
+  <label><input type="checkbox" id="fixFlip" checked> دوربینم وارونه است (تصحیح کن)</label>
+  <label><input type="checkbox" id="removeBg" checked> حذف خودکار پس‌زمینه‌ی عکس لباس</label>
+  <label><input type="checkbox" id="flipShirtV"> چرخش لباس ۱۸۰ درجه (سر و ته)</label>
+  <label><input type="checkbox" id="flipShirtH"> چرخش آینه‌ای لباس (چپ/راست)</label>
+  <label>عکس لباس (PNG - یه عکس معمولی از جلو کافیه): <input type="file" id="shirtInput" accept="image/png"></label>
+</div>
+<div id="status">در حال بارگذاری مدل...</div>
+
+<!-- MediaPipe Pose از طریق CDN -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1675466862/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils@0.3.1675466124/drawing_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5.1675469404/pose.js" crossorigin="anonymous"></script>
+
+<script>
+const videoElement = document.getElementById('webcam');
+const canvasElement = document.getElementById('output');
+const canvasCtx = canvasElement.getContext('2d');
+const statusEl = document.getElementById('status');
+const showSkeletonCheckbox = document.getElementById('showSkeleton');
+const fixFlipCheckbox = document.getElementById('fixFlip');
+
+// بوم مخفی برای تصحیح وارونگی دوربین قبل از ارسال به مدل و رسم روی صفحه
+const flipCanvas = document.createElement('canvas');
+const flipCtx = flipCanvas.getContext('2d');
+
+// اتصال به مدل Pose
+const pose = new Pose({
+  locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5.1675469404/${file}`
+});
+pose.setOptions({
+  modelComplexity: 1,
+  smoothLandmarks: true,
+  minDetectionConfidence: 0.5,
+  minTrackingConfidence: 0.5
+});
+pose.onResults(onResults);
+
+// ---------- عکس لباس ----------
+// چیدمان فرض‌شده‌ی تصویر: ۲۲٪ سمت چپ = آستین چپ، ۵۶٪ وسط = تنه، ۲۲٪ سمت راست = آستین راست
+const defaultShirtSVG = `
+<svg xmlns="http://www.w3.org/2000/svg" width="400" height="400" viewBox="0 0 400 400">
+  <rect x="4" y="30" width="82" height="230" rx="18" fill="#24446e"/>
+  <rect x="4" y="228" width="82" height="20" fill="#17304f"/>
+  <rect x="314" y="30" width="82" height="230" rx="18" fill="#24446e"/>
+  <rect x="314" y="228" width="82" height="20" fill="#17304f"/>
+  <rect x="88" y="18" width="224" height="368" rx="26" fill="#2c5490"/>
+  <rect x="88" y="366" width="224" height="20" fill="#17304f"/>
+  <rect x="150" y="30" width="18" height="330" fill="#3a63a0" opacity="0.35"/>
+</svg>`;
+let rawShirtSrc = "data:image/svg+xml;base64," + btoa(defaultShirtSVG);
+let shirtImage = new Image();
+let isDefaultShirt = true; // true = شکل نمونه با چیدمان سه‌تکه، false = عکس آپلودی کاربر (تک‌تکه)
+
+const flipHCheckbox = document.getElementById('flipShirtH');
+const flipVCheckbox = document.getElementById('flipShirtV');
+const orientCanvas = document.createElement('canvas');
+const orientCtx = orientCanvas.getContext('2d');
+
+// عکس خام (پیش‌فرض یا آپلودی) رو با چرخش‌های انتخابی کاربر بازتولید می‌کنه
+function applyOrientationAndSet() {
+  const temp = new Image();
+  temp.onload = () => {
+    const w = temp.naturalWidth, h = temp.naturalHeight;
+    orientCanvas.width = w;
+    orientCanvas.height = h;
+    orientCtx.setTransform(1, 0, 0, 1, 0, 0);
+    orientCtx.clearRect(0, 0, w, h);
+    let sx = 1, sy = 1, tx = 0, ty = 0;
+    if (flipHCheckbox.checked) { sx = -1; tx = w; }
+    if (flipVCheckbox.checked) { sy = -1; ty = h; }
+    orientCtx.setTransform(sx, 0, 0, sy, tx, ty);
+    orientCtx.drawImage(temp, 0, 0, w, h);
+    orientCtx.setTransform(1, 0, 0, 1, 0, 0);
+    shirtImage.src = orientCanvas.toDataURL('image/png');
+  };
+  temp.src = rawShirtSrc;
+}
+applyOrientationAndSet();
+flipHCheckbox.addEventListener('change', applyOrientationAndSet);
+flipVCheckbox.addEventListener('change', applyOrientationAndSet);
+
+const removeBgCheckbox = document.getElementById('removeBg');
+const bgCanvas = document.createElement('canvas');
+const bgCtx = bgCanvas.getContext('2d');
+
+// حذف خودکار پس‌زمینه‌ی یکدست روشن با نمونه‌گیری از گوشه‌های عکس
+function removeUniformBackground(img) {
+  bgCanvas.width = img.naturalWidth;
+  bgCanvas.height = img.naturalHeight;
+  bgCtx.clearRect(0, 0, bgCanvas.width, bgCanvas.height);
+  bgCtx.drawImage(img, 0, 0);
+  const w = bgCanvas.width, h = bgCanvas.height;
+  const data = bgCtx.getImageData(0, 0, w, h);
+  const px = data.data;
+
+  // میانگین رنگ گوشه‌ها به‌عنوان نمونه‌ی پس‌زمینه
+  const corners = [[2, 2], [w - 3, 2], [2, h - 3], [w - 3, h - 3]];
+  let r = 0, g = 0, b = 0;
+  corners.forEach(([cx, cy]) => {
+    const idx = (cy * w + cx) * 4;
+    r += px[idx]; g += px[idx + 1]; b += px[idx + 2];
+  });
+  r /= 4; g /= 4; b /= 4;
+
+  const innerT = 28, outerT = 70;
+  for (let i = 0; i < px.length; i += 4) {
+    const dr = px[i] - r, dg = px[i + 1] - g, db = px[i + 2] - b;
+    const dist = Math.sqrt(dr * dr + dg * dg + db * db);
+    if (dist < innerT) {
+      px[i + 3] = 0;
+    } else if (dist < outerT) {
+      px[i + 3] = Math.round(255 * (dist - innerT) / (outerT - innerT));
+    }
+  }
+  bgCtx.putImageData(data, 0, 0);
+  return bgCanvas.toDataURL('image/png');
+}
+
+document.getElementById('shirtInput').addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (ev) => {
+    const rawImg = new Image();
+    rawImg.onload = () => {
+      rawShirtSrc = removeBgCheckbox.checked ? removeUniformBackground(rawImg) : ev.target.result;
+      isDefaultShirt = false;
+      applyOrientationAndSet();
+    };
+    rawImg.src = ev.target.result;
+  };
+  reader.readAsDataURL(file);
+});
+
+// ---------- کمک‌تابع‌های برداری ----------
+const vSub = (a, b) => ({ x: a.x - b.x, y: a.y - b.y });
+const vAdd = (a, b) => ({ x: a.x + b.x, y: a.y + b.y });
+const vScale = (v, s) => ({ x: v.x * s, y: v.y * s });
+const vNorm = (v) => { const l = Math.hypot(v.x, v.y) || 1; return { x: v.x / l, y: v.y / l }; };
+const lerp = (a, b, t) => ({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
+
+// نگاشت یک مثلث از تصویر منبع به یک مثلث مقصد روی بوم (Affine Warp)
+function drawTriangleImage(ctx, img, sTri, dTri) {
+  const [x0, y0, x1, y1, x2, y2] = [sTri[0].x, sTri[0].y, sTri[1].x, sTri[1].y, sTri[2].x, sTri[2].y];
+  const [u0, v0, u1, v1, u2, v2] = [dTri[0].x, dTri[0].y, dTri[1].x, dTri[1].y, dTri[2].x, dTri[2].y];
+  const denom = x0 * (y1 - y2) + x1 * (y2 - y0) + x2 * (y0 - y1);
+  if (Math.abs(denom) < 1e-6) return;
+  const a = (u0 * (y1 - y2) + u1 * (y2 - y0) + u2 * (y0 - y1)) / denom;
+  const b = (v0 * (y1 - y2) + v1 * (y2 - y0) + v2 * (y0 - y1)) / denom;
+  const c = (u0 * (x2 - x1) + u1 * (x0 - x2) + u2 * (x1 - x0)) / denom;
+  const d = (v0 * (x2 - x1) + v1 * (x0 - x2) + v2 * (x1 - x0)) / denom;
+  const e = (u0 * (x1 * y2 - x2 * y1) + u1 * (x2 * y0 - x0 * y2) + u2 * (x0 * y1 - x1 * y0)) / denom;
+  const f = (v0 * (x1 * y2 - x2 * y1) + v1 * (x2 * y0 - x0 * y2) + v2 * (x0 * y1 - x1 * y0)) / denom;
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(dTri[0].x, dTri[0].y);
+  ctx.lineTo(dTri[1].x, dTri[1].y);
+  ctx.lineTo(dTri[2].x, dTri[2].y);
+  ctx.closePath();
+  ctx.clip();
+  ctx.transform(a, b, c, d, e, f);
+  ctx.drawImage(img, 0, 0);
+  ctx.restore();
+}
+
+// نگاشت یک چهارضلعی (به‌صورت دو مثلث) از منبع به مقصد
+function drawQuadImage(ctx, img, sQuad, dQuad) {
+  drawTriangleImage(ctx, img, [sQuad[0], sQuad[1], sQuad[2]], [dQuad[0], dQuad[1], dQuad[2]]);
+  drawTriangleImage(ctx, img, [sQuad[0], sQuad[2], sQuad[3]], [dQuad[0], dQuad[2], dQuad[3]]);
+}
+
+// یک بخش از آستین (بازوی بالا یا ساعد) را می‌کشد
+function drawSleeveSegment(ctx, img, startPt, endPt, outwardDir, wStart, wEnd, imgW, imgH, side, srcYStart, srcYEnd) {
+  const outerStart = vAdd(startPt, vScale(outwardDir, wStart));
+  const outerEnd = vAdd(endPt, vScale(outwardDir, wEnd));
+  const srcX0 = side === 'left' ? 2 : imgW * 0.785;
+  const srcX1 = side === 'left' ? imgW * 0.215 : imgW - 2;
+  const src = [
+    { x: srcX0, y: imgH * srcYStart },
+    { x: srcX1, y: imgH * srcYStart },
+    { x: srcX1, y: imgH * srcYEnd },
+    { x: srcX0, y: imgH * srcYEnd }
+  ];
+  const dst = [startPt, outerStart, outerEnd, endPt];
+  drawQuadImage(ctx, img, src, dst);
+}
+
+// برش یقه (مشترک بین هر دو حالت) با کمک بینی و گوش‌ها برای عرض یقه
+function drawCollarCutout(ctx, shL, shR, shoulderCenter, nose, earL, earR, shoulderWidth) {
+  if (!nose || !earL || !earR) return;
+  const neckWidthFactor = Math.min(0.42, Math.max(0.16, Math.hypot(earR.x - earL.x, earR.y - earL.y) / shoulderWidth * 0.5));
+  const collarL = lerp(shL, shoulderCenter, neckWidthFactor);
+  const collarR = lerp(shR, shoulderCenter, neckWidthFactor);
+  const neckTop = lerp(shoulderCenter, nose, 0.32);
+
+  ctx.save();
+  ctx.globalCompositeOperation = 'destination-out';
+  ctx.beginPath();
+  ctx.moveTo(collarL.x, collarL.y);
+  ctx.lineTo(neckTop.x, neckTop.y);
+  ctx.lineTo(collarR.x, collarR.y);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+// حالت پیش‌فرض: لباس نمونه با چیدمان سه‌تکه (آستین چپ | تنه | آستین راست)
+// نقاط اسکلتی استفاده‌شده (۱۱ نقطه): بینی، دو گوش، دو شونه، دو آرنج، دو مچ، دو باسن
+function drawShirtMultiPart(ctx, shL, shR, elL, elR, wrL, wrR, hipL, hipR, nose, earL, earR, shoulderCenter, shoulderWidth, imgW, imgH) {
+  const torsoSrc = [
+    { x: imgW * 0.22, y: imgH * 0.05 },
+    { x: imgW * 0.78, y: imgH * 0.05 },
+    { x: imgW * 0.78, y: imgH * 0.95 },
+    { x: imgW * 0.22, y: imgH * 0.95 }
+  ];
+  drawQuadImage(ctx, shirtImage, torsoSrc, [shL, shR, hipR, hipL]);
+
+  const outwardL = vNorm(vSub(shL, shoulderCenter));
+  const outwardR = vNorm(vSub(shR, shoulderCenter));
+  const wTop = shoulderWidth * 0.42, wElbow = shoulderWidth * 0.30, wWrist = shoulderWidth * 0.22;
+
+  drawSleeveSegment(ctx, shirtImage, shL, elL, outwardL, wTop, wElbow, imgW, imgH, 'left', 0.05, 0.5);
+  drawSleeveSegment(ctx, shirtImage, elL, wrL, outwardL, wElbow, wWrist, imgW, imgH, 'left', 0.5, 0.9);
+  drawSleeveSegment(ctx, shirtImage, shR, elR, outwardR, wTop, wElbow, imgW, imgH, 'right', 0.05, 0.5);
+  drawSleeveSegment(ctx, shirtImage, elR, wrR, outwardR, wElbow, wWrist, imgW, imgH, 'right', 0.5, 0.9);
+
+  drawCollarCutout(ctx, shL, shR, shoulderCenter, nose, earL, earR, shoulderWidth);
+}
+
+// حالت عکس آپلودی: کل عکس یکجا فقط بزرگ/کوچیک و چرخش می‌شه (بدون تقسیم به تکه)
+// چون عکس‌های معمولی (نه چیدمان بازشده) با تقسیم به آستین/تنه به‌هم می‌ریزن و برعکس می‌شن
+function drawShirtSinglePiece(ctx, shL, shR, hipL, hipR, nose, earL, earR, shoulderCenter, shoulderWidth) {
+  const hipCenter = { x: (hipL.x + hipR.x) / 2, y: (hipL.y + hipR.y) / 2 };
+  const torsoLength = Math.hypot(hipCenter.x - shoulderCenter.x, hipCenter.y - shoulderCenter.y);
+  const angle = Math.atan2(shR.y - shL.y, shR.x - shL.x);
+
+  const drawWidth = shoulderWidth * 2.1;
+  const drawHeight = torsoLength * 2.0;
+
+  ctx.save();
+  ctx.translate(shoulderCenter.x, shoulderCenter.y);
+  ctx.rotate(angle);
+  ctx.drawImage(shirtImage, -drawWidth / 2, -drawHeight * 0.12, drawWidth, drawHeight);
+  ctx.restore();
+
+  drawCollarCutout(ctx, shL, shR, shoulderCenter, nose, earL, earR, shoulderWidth);
+}
+
+function drawShirt(ctx, lm, w, h) {
+  const P = (i) => (lm[i] ? { x: lm[i].x * w, y: lm[i].y * h } : null);
+  const nose = P(0), earL = P(7), earR = P(8);
+  const shL = P(11), shR = P(12);
+  const elL = P(13), elR = P(14);
+  const wrL = P(15), wrR = P(16);
+  const hipL = P(23), hipR = P(24);
+
+  const required = [shL, shR, hipL, hipR];
+  if (required.some((p) => !p)) return;
+
+  const imgW = shirtImage.naturalWidth, imgH = shirtImage.naturalHeight;
+  if (!imgW || !imgH) return;
+
+  const shoulderCenter = { x: (shL.x + shR.x) / 2, y: (shL.y + shR.y) / 2 };
+  const shoulderWidth = Math.hypot(shR.x - shL.x, shR.y - shL.y);
+
+  if (isDefaultShirt && elL && elR && wrL && wrR) {
+    drawShirtMultiPart(ctx, shL, shR, elL, elR, wrL, wrR, hipL, hipR, nose, earL, earR, shoulderCenter, shoulderWidth, imgW, imgH);
+  } else {
+    drawShirtSinglePiece(ctx, shL, shR, hipL, hipR, nose, earL, earR, shoulderCenter, shoulderWidth);
+  }
+}
+
+function onResults(results) {
+  canvasElement.width = results.image.width;
+  canvasElement.height = results.image.height;
+
+  canvasCtx.save();
+  canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+  canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+
+  if (results.poseLandmarks) {
+    if (shirtImage.complete && shirtImage.naturalWidth > 0) {
+      drawShirt(canvasCtx, results.poseLandmarks, canvasElement.width, canvasElement.height);
+    }
+    if (showSkeletonCheckbox.checked) {
+      drawConnectors(canvasCtx, results.poseLandmarks, POSE_CONNECTIONS, { color: '#00FF00', lineWidth: 2 });
+      drawLandmarks(canvasCtx, results.poseLandmarks, { color: '#FF0000', lineWidth: 1, radius: 3 });
+    }
+    statusEl.textContent = `تعداد نقاط شناسایی‌شده: ${results.poseLandmarks.length}`;
+  } else {
+    statusEl.textContent = 'بدن شناسایی نشد - لطفاً کامل جلوی دوربین بایست';
+  }
+  canvasCtx.restore();
+}
+
+// راه‌اندازی دوربین
+const camera = new Camera(videoElement, {
+  onFrame: async () => {
+    const vw = videoElement.videoWidth || 640;
+    const vh = videoElement.videoHeight || 480;
+    if (fixFlipCheckbox.checked) {
+      flipCanvas.width = vw;
+      flipCanvas.height = vh;
+      flipCtx.save();
+      flipCtx.translate(vw, vh);
+      flipCtx.rotate(Math.PI);
+      flipCtx.drawImage(videoElement, 0, 0, vw, vh);
+      flipCtx.restore();
+      await pose.send({ image: flipCanvas });
+    } else {
+      await pose.send({ image: videoElement });
+    }
+  },
+  width: 640,
+  height: 480
+});
+
+camera.start()
+  .then(() => { statusEl.textContent = 'دوربین فعال شد ✅'; })
+  .catch((err) => { statusEl.textContent = 'خطا در دسترسی به دوربین: ' + err.message; });
+</script>
+
+</body>
+</html>
